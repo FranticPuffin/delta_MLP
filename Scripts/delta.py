@@ -340,7 +340,7 @@ def run_dynamic_optimization(data_path):
     weights = {m_id: 1.0 for m_id in mission_ids}
     eta = 0.15  
     eta_plus = 0.05 
-    k_max = 5 
+    k_max = 10 
 
     print("="*60)
     print(f"地面探测站航天器检测任务调度优化 - Delta-MILP 算法")
