@@ -1,10 +1,14 @@
 import json
 import pulp
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # 非交互后端，确保无显示器环境也能保存图片
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 import platform
+import os
+import subprocess
 
 # 优先级等级定义 (1-5, 5为最高)
 PRIORITY_LEVELS = {
@@ -84,8 +88,9 @@ class DeltaMILPScheduler:
 
     def _resolve_conflicts(self, candidates):
         """
-        冲突解决：当天线时间槽冲突时，优先保留高优先级任务，舍弃低优先级任务
-        同时检查任务级互斥（同一航天器不能同时占用两个天线）
+        冲突解决：当天线时间槽冲突时，优先保留高优先级任务，舍弃低优先级任务。
+        天线选择策略：同一活动有多根天线可选时，优先选覆盖时长最长的天线（"看全程"），
+        同一任务内尽量复用已选天线以减少天线使用数量。
         """
         if not candidates:
             return []
@@ -99,55 +104,73 @@ class DeltaMILPScheduler:
             max_pri = max((s['priority'] for s in pri_schedule), default=base_pri)
             priority_map[m_id] = max_pri
 
-        # 按优先级降序排列（高优先级先分配资源），同优先级按开始时间升序
-        sorted_candidates = sorted(candidates,
-                                   key=lambda x: (-priority_map.get(x['Mission'], 3), x['Start']))
+        # 1. 按活动分组候选
+        from collections import defaultdict
+        by_activity = defaultdict(list)
+        for c in candidates:
+            by_activity[c['Activity']].append(c)
+
+        # 2. 对各活动内的天线候选排序：覆盖率高的优先，其次优先复用同任务天线
+        mission_antennas = defaultdict(set)  # mission -> 已使用的天线集合
+
+        for act_key in by_activity:
+            mission = by_activity[act_key][0]['Mission']
+            by_activity[act_key].sort(key=lambda c: (
+                -c['Coverage'],                              # 主排序：覆盖时长长 → 优先
+                0 if c['Antenna'] in mission_antennas[mission] else 1  # 次排序：复用天线 → 优先
+            ))
+
+        # 3. 按优先级降序排列活动（高优先级活动先分配资源），同优先级按开始时间升序
+        def activity_sort_key(act_key):
+            first = by_activity[act_key][0]
+            return (-priority_map.get(first['Mission'], 3), first['Start'])
+
+        sorted_activities = sorted(by_activity.keys(), key=activity_sort_key)
 
         final_schedule = []
         antenna_timeline = {}   # antenna -> list of (start, end) 已占用区间
         mission_timeline = {}   # mission -> list of (start, end) 已占用区间
-        scheduled_activities = set()  # 已调度的活动ID
 
         dropped_count = 0
         dropped_by_priority = []  # 记录被舍弃的任务及优先级
 
-        for item in sorted_candidates:
-            act_key = item['Activity']
-            if act_key in scheduled_activities:
-                continue  # 该活动已调度，跳过
+        for act_key in sorted_activities:
+            mission = by_activity[act_key][0]['Mission']
+            scheduled = False
 
-            antenna = item['Antenna']
-            mission = item['Mission']
-            # 包含 setup 和 teardown 的完整占用区间
-            item_start = item['Start'] - item['Setup']
-            item_end = item['End'] + item['Teardown']
+            # 按排序好的天线候选依次尝试（最佳天线优先）
+            for item in by_activity[act_key]:
+                antenna = item['Antenna']
+                # 包含 setup 和 teardown 的完整占用区间
+                item_start = item['Start'] - item['Setup']
+                item_end = item['End'] + item['Teardown']
 
-            # --- 检查天线级冲突 (Constraint 6h) ---
-            if antenna not in antenna_timeline:
-                antenna_timeline[antenna] = []
-            antenna_conflict = False
-            for (start, end) in antenna_timeline[antenna]:
-                if item_start < end and start < item_end:
-                    antenna_conflict = True
+                # --- 检查天线级冲突 (Constraint 6h) ---
+                antenna_conflict = False
+                for (start, end) in antenna_timeline.get(antenna, []):
+                    if item_start < end and start < item_end:
+                        antenna_conflict = True
+                        break
+
+                # --- 检查任务级冲突 (Constraint 6j: 同一航天器不能同时占用两个天线) ---
+                mission_conflict = False
+                for (start, end) in mission_timeline.get(mission, []):
+                    if item_start < end and start < item_end:
+                        mission_conflict = True
+                        break
+
+                if not antenna_conflict and not mission_conflict:
+                    # 无冲突，保留该活动
+                    antenna_timeline.setdefault(antenna, []).append((item_start, item_end))
+                    mission_timeline.setdefault(mission, []).append((item_start, item_end))
+                    mission_antennas[mission].add(antenna)
+                    final_schedule.append(item)
+                    scheduled = True
                     break
+                # 有冲突 → 继续尝试该活动的下一个天线候选
 
-            # --- 检查任务级冲突 (Constraint 6j: 同一航天器不能同时占用两个天线) ---
-            if mission not in mission_timeline:
-                mission_timeline[mission] = []
-            mission_conflict = False
-            for (start, end) in mission_timeline[mission]:
-                if item_start < end and start < item_end:
-                    mission_conflict = True
-                    break
-
-            if not antenna_conflict and not mission_conflict:
-                # 无冲突，保留该活动
-                antenna_timeline[antenna].append((item_start, item_end))
-                mission_timeline[mission].append((item_start, item_end))
-                scheduled_activities.add(act_key)
-                final_schedule.append(item)
-            else:
-                # 有冲突，舍弃该活动（因为高优先级已先处理，此处舍弃的必然是低优先级）
+            if not scheduled:
+                # 所有天线候选均冲突，舍弃该活动
                 dropped_count += 1
                 dropped_by_priority.append((mission, priority_map.get(mission, 3)))
 
@@ -159,6 +182,14 @@ class DeltaMILPScheduler:
                   f"保留 {len(final_schedule)} 个活动")
             print(f"  被舍弃活动平均优先级: {avg_dropped_pri:.2f}, "
                   f"保留活动平均优先级: {avg_kept_pri:.2f}")
+
+        # 统计天线复用情况
+        total_antennas = set()
+        for item in final_schedule:
+            total_antennas.add(item['Antenna'])
+        per_mission_antennas = {m_id: len(ants) for m_id, ants in mission_antennas.items()}
+        avg_antennas = sum(per_mission_antennas.values()) / len(per_mission_antennas) if per_mission_antennas else 0
+        print(f"  [天线统计] 共使用 {len(total_antennas)} 根天线，每任务平均天线数: {avg_antennas:.1f}")
 
         return final_schedule
 
@@ -238,12 +269,18 @@ class DeltaMILPScheduler:
                 if pulp.value(x[a_id]) is not None and pulp.value(x[a_id]) > 0.5:
                     # 为该活动的每个视图窗口生成候选
                     for vp in act['view_periods']:
+                        # 计算该天线窗口能实际覆盖的时长
+                        desired_end = vp['start_hr'] + act['d_max']
+                        trackable_end = min(vp['end_hr'], desired_end)
+                        coverage = max(trackable_end - vp['start_hr'], 0)
                         raw_candidates.append({
                             "Mission": m_id,
                             "Activity": a_id,
                             "Antenna": vp['antenna'],
                             "Start": vp['start_hr'],
-                            "End": vp['start_hr'] + act['d_max'],
+                            "End": desired_end,
+                            "ViewEnd": vp['end_hr'],
+                            "Coverage": coverage,  # 该天线实际可追踪时长
                             "Setup": act['setup_min'] / 60,
                             "Teardown": act['teardown_min'] / 60
                         })
@@ -270,45 +307,58 @@ def visualize_and_save(schedule_list, filename="dsn_schedule.csv"):
     df.to_csv(filename, index=False)
     print(f"详细调度表已保存至: {filename}")
 
-    # 2. 绘制甘特图
+    # 2. 绘制甘特图 — 纵轴为任务(Mission)，颜色表示天线(Antenna)
     plt.figure(figsize=(18, 10))
+    missions = sorted(df['Mission'].unique())
     antennas = sorted(df['Antenna'].unique())
-    missions = df['Mission'].unique()
-    colors = plt.cm.tab20(np.linspace(0, 1, len(missions)))
-    color_map = dict(zip(missions, colors))
+    colors = plt.cm.tab20(np.linspace(0, 1, len(antennas)))
+    color_map = dict(zip(antennas, colors))
 
     for i, row in df.iterrows():
-        ant_idx = antennas.index(row['Antenna'])
-        
-        # 绘制准备时间 (Setup) - 灰色
-        plt.barh(ant_idx, row['Setup'], left=row['Start'] - row['Setup'], 
-                 color='lightgrey', edgecolor='gray', alpha=0.5)
-        
-        # 绘制跟踪时间 (Tracking) - 任务颜色
-        plt.barh(ant_idx, row['End'] - row['Start'], left=row['Start'], 
-                 color=color_map[row['Mission']], edgecolor='black', label=row['Mission'])
-        
-        # 绘制拆除时间 (Teardown) - 灰色
-        plt.barh(ant_idx, row['Teardown'], left=row['End'], 
-                 color='lightgrey', edgecolor='gray', alpha=0.5)
-        
-        # 标注任务名
-        plt.text(row['Start'], ant_idx, row['Mission'], va='center', ha='left', fontsize=6)
+        mission_idx = missions.index(row['Mission'])
 
-    plt.yticks(range(len(antennas)), antennas, fontsize=7)
+        # 绘制准备时间 (Setup) - 灰色
+        plt.barh(mission_idx, row['Setup'], left=row['Start'] - row['Setup'],
+                 color='lightgrey', edgecolor='gray', alpha=0.5)
+
+        # 绘制跟踪时间 (Tracking) - 天线颜色
+        plt.barh(mission_idx, row['End'] - row['Start'], left=row['Start'],
+                 color=color_map[row['Antenna']], edgecolor='black', label=row['Antenna'])
+
+        # 绘制拆除时间 (Teardown) - 灰色
+        plt.barh(mission_idx, row['Teardown'], left=row['End'],
+                 color='lightgrey', edgecolor='gray', alpha=0.5)
+
+        # 标注天线名
+        plt.text(row['Start'], mission_idx, row['Antenna'], va='center', ha='left', fontsize=6)
+
+    plt.yticks(range(len(missions)), missions, fontsize=7)
     plt.xlabel("时间 (小时, 从周一 00:00 开始)")
     plt.title("地面探测站航天器检测任务调度甘特图 (Delta-MILP 优先级调度)")
     plt.grid(axis='x', linestyle='--', alpha=0.7)
-    
+
     # 防止图例重复
     handles, labels = plt.gca().get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    plt.legend(by_label.values(), by_label.keys(), loc='upper right', 
-               bbox_to_anchor=(1.15, 1), fontsize=7)
+    plt.legend(by_label.values(), by_label.keys(), loc='upper right',
+               bbox_to_anchor=(1.15, 1), fontsize=7, title="天线")
     
     plt.tight_layout()
-    plt.savefig("dsn_gantt_chart.png", dpi=150)
-    plt.show()
+    img_path = "dsn_gantt_chart.png"
+    plt.savefig(img_path, dpi=150)
+    plt.close()
+    print(f"甘特图已保存至: {img_path}")
+
+    # 使用系统默认图片查看器打开
+    try:
+        if platform.system() == "Windows":
+            os.startfile(img_path)
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", img_path])
+        else:
+            subprocess.Popen(["xdg-open", img_path])
+    except Exception as e:
+        print(f"无法自动打开图片查看器: {e}")
 
 # --- 3. 动态权重迭代逻辑 (Algorithm 2) ---
 import sys
