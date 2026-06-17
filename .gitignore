@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Offline packages (large binary files, not version-controlled)
+packages/
+
+# Bundled GLPK solver (binary, not version-controlled)
+glpk/
+
+# Output files (generated at runtime)
+Outputs/optimization_log.txt
+dsn_schedule.csv
+dsn_gantt_chart.png

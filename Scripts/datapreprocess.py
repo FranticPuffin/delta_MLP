@@ -4,8 +4,9 @@ import random
 import numpy as np
 import os
 
-# 确保目录存在
-Data_path = "../Data/dsn_data.jsonl"
+# 确保目录存在（使用脚本相对路径，支持离线部署时任意目录启动）
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+Data_path = os.path.join(_SCRIPT_DIR, "..", "Data", "dsn_data.jsonl")
 os.makedirs(os.path.dirname(Data_path), exist_ok=True)
 
 # 优先级等级定义 (1-5, 5为最高)

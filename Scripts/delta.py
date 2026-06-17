@@ -8,6 +8,7 @@ import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 import platform
 import os
+import shutil
 import subprocess
 
 # 优先级等级定义 (1-5, 5为最高)
@@ -18,6 +19,27 @@ PRIORITY_LEVELS = {
     4: "高优先级(关键事件/飞掠)",
     5: "最高优先级(紧急/不可重访)"
 }
+
+# --- GLPK solver path auto-detection (for offline deployment) ---
+def _get_glpk_path():
+    """Auto-detect the GLPK solver executable.
+
+    Resolution order:
+    1. Bundled: <project>/glpk/glpsol.exe (offline deployment)
+    2. System PATH: glpsol.exe / glpsol (development convenience)
+    3. Bare name: "glpsol" (let PuLP attempt PATH lookup)
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.normpath(os.path.join(script_dir, "..", "glpk", "glpsol.exe"))
+    if os.path.isfile(bundled):
+        return bundled
+    found = shutil.which("glpsol.exe") or shutil.which("glpsol")
+    if found:
+        return found
+    return "glpsol"
+
+_GLPK_PATH = _get_glpk_path()
+
 
 def set_ch_font():
     # 1. 解决中文显示问题
@@ -32,6 +54,14 @@ def set_ch_font():
     
     # 2. 必须设置这个参数，否则中文字体生效后，坐标轴的负号 '-' 会变成方框
     plt.rcParams['axes.unicode_minus'] = False
+
+    # 3. 验证所选字体是否实际存在（精简版 Windows 可能缺少中文字体）
+    try:
+        from matplotlib.font_manager import findfont, FontProperties
+        test_font = FontProperties(family=plt.rcParams['font.sans-serif'][0])
+        found = findfont(test_font, fallback_to_default=True)
+    except Exception:
+        pass  # 静默回退，字体链通常能处理
 
 # --- 算法实现核心类 ---
 class DeltaMILPScheduler:
@@ -256,7 +286,7 @@ class DeltaMILPScheduler:
         prob += pulp.lpSum(total_resource_usage) <= 40 * 168 * 0.7  # 40台天线, 70%利用率
 
         # 4. 执行求解 - 使用GLPK并设置时间限制
-        solver = pulp.GLPK_CMD(msg=1, options=['--tmlim', '60'])  # 每次求解最多60秒
+        solver = pulp.GLPK_CMD(msg=1, options=['--tmlim', '60'], path=_GLPK_PATH)  # 每次求解最多60秒
         prob.solve(solver) 
         
         # 5. 生成候选调度结果（为每个已调度活动生成所有可选视图窗口的候选）
@@ -375,7 +405,13 @@ class Logger(object):
         self.log = open(filename, "w", encoding="utf-8")
 
     def write(self, message):
-        self.terminal.write(message)
+        try:
+            self.terminal.write(message)
+        except UnicodeEncodeError:
+            # Windows GBK console can't handle ✓/✗ — replace with ASCII
+            import re
+            safe = message.replace('✓', '[OK]').replace('✗', '[XX]')
+            self.terminal.write(safe)
         self.log.write(message)
 
     def flush(self):
