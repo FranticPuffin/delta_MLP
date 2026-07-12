@@ -2,25 +2,23 @@
 chcp 65001 >nul
 
 echo ============================================
-echo   DSN Delta-MILP - 数据生成器
+echo   DSN Delta-MILP - Data generator
 echo ============================================
 
-set SCRIPT_DIR=%~dp0
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+set "PY=%ROOT%\python\python.exe"
 
-:: 激活虚拟环境
-if exist "%SCRIPT_DIR%.venv\Scripts\activate.bat" (
-    call "%SCRIPT_DIR%.venv\Scripts\activate.bat"
-) else (
-    echo [警告] 未找到 .venv，请先运行 install.bat。
-    echo 尝试使用系统 Python 运行...
+if not exist "%PY%" (
+    echo [WARN] Bundled Python not found, falling back to system python.
+    set "PY=python"
 )
 
-:: 确保 Outputs 目录存在
-if not exist "%SCRIPT_DIR%Outputs" mkdir "%SCRIPT_DIR%Outputs"
+if not exist "%ROOT%\Data"    mkdir "%ROOT%\Data"
+if not exist "%ROOT%\Outputs" mkdir "%ROOT%\Outputs"
 
-:: 运行数据生成器
-python "%SCRIPT_DIR%Scripts\datapreprocess.py"
+"%PY%" "%ROOT%\Scripts\datapreprocess.py"
 
 echo.
-echo 完成。数据已保存至: %SCRIPT_DIR%Data\dsn_data.jsonl
+echo Done. Data written to: %ROOT%\Data\dsn_data.jsonl
 pause

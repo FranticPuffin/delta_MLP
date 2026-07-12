@@ -1,0 +1,33 @@
+Problem:    
+Rows:       3
+Columns:    3 (3 integer, 3 binary)
+Non-zeros:  3
+Status:     INTEGER OPTIMAL
+Objective:  OBJ = 0 (MINimum)
+
+   No.   Row name        Activity     Lower bound   Upper bound
+------ ------------    ------------- ------------- -------------
+     1 _C1                         0                           1 
+     2 _C2                         0                           1 
+     3 _C3                         0                           1 
+
+   No. Column name       Activity     Lower bound   Upper bound
+------ ------------    ------------- ------------- -------------
+     1 u_77_82_79_95_65_67_84_95_48_48
+                    *              0             0             1 
+     2 u_23270_23077_19971_21495_95_65_67_84_95_48_48
+                    *              0             0             1 
+     3 u_22825_38382_19977_21495_95_65_67_84_95_48_48
+                    *              0             0             1 
+
+Integer feasibility conditions:
+
+KKT.PE: max.abs.err = 0.00e+00 on row 0
+        max.rel.err = 0.00e+00 on row 0
+        High quality
+
+KKT.PB: max.abs.err = 0.00e+00 on row 0
+        max.rel.err = 0.00e+00 on row 0
+        High quality
+
+End of output

@@ -18,44 +18,22 @@ PRIORITY_LEVELS = {
     5: "最高优先级(紧急/不可重访)"
 }
 
-def generate_priority_schedule(base_priority, horizon_hr=168):
-    """
-    为任务生成优先级时段表 priority_schedule
-    - 将168小时划分为若干时段，每时段赋予优先级
-    - 基础优先级作为底色，部分时段会因关键事件提升优先级
-    """
-    schedule = []
-    t = 0.0
-    while t < horizon_hr:
-        # 段长度: 8~48小时随机
-        seg_len = random.uniform(8, 48)
-        seg_end = min(t + seg_len, horizon_hr)
-        
-        # 大部分时段使用 base_priority，有概率提升
-        if random.random() < 0.3:  # 30%概率出现优先级提升
-            # 提升幅度: +1 或 +2，不超过5
-            boost = random.choice([1, 2])
-            seg_pri = min(base_priority + boost, 5)
-        else:
-            seg_pri = base_priority
-        
-        schedule.append({
-            "start_hr": round(t, 2),
-            "end_hr": round(seg_end, 2),
-            "priority": seg_pri
-        })
-        t = seg_end
-    return schedule
-
 def generate_dsn_jsonl(output_file=Data_path, num_missions=100):
     """
     生成扩充版的 DSN 调度数据集
-    - 天线数量: 40
+    - 地面站天线数量: 40
+    - 中继星天线数量: 5
     - 任务数量: 100
-    - 包含 base_priority 和 priority_schedule 字段
+    - 任务包含 base_priority 字段
+    - 不再生成 priority_schedule 时段优先级
+    - 每个活动包含 prior 活动优先级字段，与 d_min、d_max 同级
+    - 每个活动包含 prefer 字段，表示倾向的天线策略
+    - 每个视图周期包含 antenna_type 字段，表示天线属性
     """
-    # 1. 扩充天线池至 40 个 (模拟全球三个综合体的编号)
-    antennas = [f"DSS-{i}" for i in range(10, 50)] 
+    # 1. 扩充天线池：40 个地面站 + 5 个中继星
+    ground_antennas = [f"DSS-{i}" for i in range(10, 50)]
+    relay_antennas = [f"RELAY-{i}" for i in range(1, 6)]
+    antennas = ground_antennas + relay_antennas
     
     # 典型任务配置采样 —— 前4个任务使用人工定义的有意义的优先级
     mission_templates = [
@@ -88,7 +66,6 @@ def generate_dsn_jsonl(output_file=Data_path, num_missions=100):
                 "mission_id": template["name"],
                 "total_requested_hr": template["tr_hr"],
                 "base_priority": template["base_priority"],
-                "priority_schedule": generate_priority_schedule(template["base_priority"]),
                 "activities": []
             }
 
@@ -99,16 +76,25 @@ def generate_dsn_jsonl(output_file=Data_path, num_missions=100):
                 for v_idx in range(random.randint(1, 4)):
                     start_hr = random.uniform(0, 168) # 模拟一周 168 小时内的跨度
                     duration = random.uniform(template["d_max"], template["d_max"] + 6)
+                    antenna = random.choice(antennas)
+                    # 天线属性：0 表示中继星，1 表示地面站
+                    antenna_type = 0 if antenna.startswith("RELAY") else 1
                     view_periods.append({
-                        "antenna": random.choice(antennas),
+                        "antenna": antenna,
+                        "antenna_type": antenna_type,
                         "start_hr": round(start_hr, 2),
                         "end_hr": round(start_hr + duration, 2)
                     })
+
+                # 倾向的天线策略：0 倾向中继星，1 倾向地面站，2 默认策略
+                prefer = random.choice([0, 1, 2])
 
                 mission_entry["activities"].append({
                     "activity_id": f"{template['name']}_ACT_{a_idx:02d}",
                     "d_min": template["d_min"],
                     "d_max": template["d_max"],
+                    "prior": template["base_priority"],
+                    "prefer": prefer,
                     "setup_min": 60,
                     "teardown_min": 15,
                     "can_split": template["d_max"] >= 8.0,
@@ -122,6 +108,8 @@ def generate_dsn_jsonl(output_file=Data_path, num_missions=100):
     print(f"目标文件: {output_file}")
     print(f"任务总数: {num_missions}")
     print(f"可用天线数: {len(antennas)}")
+    print(f"  - 地面站: {len(ground_antennas)}")
+    print(f"  - 中继星: {len(relay_antennas)}")
 
 # --- 执行生成 ---
 generate_dsn_jsonl()

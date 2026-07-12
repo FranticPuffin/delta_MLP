@@ -30,8 +30,8 @@ delta.py (518 行)
 ├── 核心类: DeltaMILPScheduler
 │   ├── __init__()          — 加载数据，设时间帧
 │   ├── _load_data()        — 解析 JSONL
-│   ├── _get_priority_at_time()     — 时间点优先级查询
-│   ├── _get_activity_priority()    — 活动加权优先级计算
+│   ├── _get_priority_at_time()     — 时间点优先级查询（旧版 priority_schedule 兼容）
+│   ├── _get_activity_priority()    — 活动优先级读取/计算
 │   ├── _resolve_conflicts()        — 冲突解决 & 天线选择
 │   └── solve()             — MILP 建模求解
 ├── 可视化: visualize_and_save()
@@ -62,9 +62,8 @@ def __init__(self, data_path, total_horizon_hr=168, granularity_min=15):
 ```
 {
   mission_id, total_requested_hr, base_priority,
-  priority_schedule: [{start_hr, end_hr, priority}, ...],
   activities: [{
-    activity_id, d_min, d_max, setup_min, teardown_min, can_split,
+    activity_id, d_min, d_max, prior, setup_min, teardown_min, can_split,
     view_periods: [{antenna, start_hr, end_hr}, ...]
   }]
 }
@@ -72,15 +71,11 @@ def __init__(self, data_path, total_horizon_hr=168, granularity_min=15):
 
 ### 3.3 `_get_priority_at_time()`（第 51–57 行）
 
-根据 `priority_schedule` 分段查找 `time_hr` 所属时段的优先级。若无 schedule 则返回 `base_priority`。
+新版 `datapreprocess.py` 不再生成 `priority_schedule` 时段优先级；若旧数据仍包含 schedule，可按时间段兼容读取，否则返回 `base_priority`。
 
 ### 3.4 `_get_activity_priority()`（第 59–87 行）
 
-计算活动在其所有视图窗口上的 **时间加权平均优先级**：
-
-- 对每个 view_period，计算其与各 `priority_schedule` 时段的重叠时长
-- 加权求和：`Σ(priority × overlap_duration) / Σ(overlap_duration)`
-- 若无覆盖则回退到 `base_priority`
+新版数据在每个 activity 上直接提供活动优先级 `prior`，与 `d_min`、`d_max` 同级。调度时可优先读取 `activity["prior"]`；若旧数据缺少该字段，则回退到 `base_priority`。
 
 **用途**：在 MILP 目标函数中作为 `priority²` 的基数，使高优先级活动获得更大的优化系数。
 

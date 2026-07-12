@@ -1,554 +1,444 @@
+"""
+delta.py Web API wrapper.
+
+Keeps the original implementation in delta_core.py and exposes HTTP endpoints.
+
+Usage:
+    python Scripts/delta.py [original args...]
+    python Scripts/delta.py --api --host 0.0.0.0 --port 8000
+
+Main endpoints:
+    GET  /health
+    POST /api/delta/run
+    GET  /api/delta/functions
+    POST /api/delta/call/{function_name}
+    POST /api/delta/dsn-data/view-periods
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
 import json
-import pulp
-import pandas as pd
-import matplotlib
-matplotlib.use('Agg')  # 非交互后端，确保无显示器环境也能保存图片
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from datetime import datetime, timedelta
-import platform
 import os
-import shutil
+from pathlib import Path
+import runpy
 import subprocess
+import sys
+import traceback
+from typing import Any, Dict, List, Optional
 
-# 优先级等级定义 (1-5, 5为最高)
-PRIORITY_LEVELS = {
-    1: "低优先级(常规监测)",
-    2: "中低优先级(常规通信)",
-    3: "中优先级(科学数据下行)",
-    4: "高优先级(关键事件/飞掠)",
-    5: "最高优先级(紧急/不可重访)"
-}
-
-# --- GLPK solver path auto-detection (for offline deployment) ---
-def _get_glpk_path():
-    """Auto-detect the GLPK solver executable.
-
-    Resolution order:
-    1. Bundled: <project>/glpk/glpsol.exe (offline deployment)
-    2. System PATH: glpsol.exe / glpsol (development convenience)
-    3. Bare name: "glpsol" (let PuLP attempt PATH lookup)
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    bundled = os.path.normpath(os.path.join(script_dir, "..", "glpk", "glpsol.exe"))
-    if os.path.isfile(bundled):
-        return bundled
-    found = shutil.which("glpsol.exe") or shutil.which("glpsol")
-    if found:
-        return found
-    return "glpsol"
-
-_GLPK_PATH = _get_glpk_path()
+from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field, field_validator
 
 
-def set_ch_font():
-    # 1. 解决中文显示问题
-    system = platform.system()
-    if system == "Windows":
-        # Windows 下常用的黑体
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial'] 
-    elif system == "Darwin": # macOS
-        plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']
-    else: # Linux
-        plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
-    
-    # 2. 必须设置这个参数，否则中文字体生效后，坐标轴的负号 '-' 会变成方框
-    plt.rcParams['axes.unicode_minus'] = False
+THIS_FILE = Path(__file__).resolve()
+SCRIPTS_DIR = THIS_FILE.parent
+PROJECT_ROOT = SCRIPTS_DIR.parent
+CORE_FILE = SCRIPTS_DIR / "delta_core.py"
+DSN_DATA_FILE = PROJECT_ROOT / "Data" / "dsn_data.jsonl"
 
-    # 3. 验证所选字体是否实际存在（精简版 Windows 可能缺少中文字体）
+
+class RunRequest(BaseModel):
+    args: List[str] = Field(default_factory=list)
+    stdin: Optional[Any] = None
+    timeout: int = Field(default=300, ge=1)
+    cwd: Optional[str] = None
+    parse_json: bool = True
+
+
+class FunctionCallRequest(BaseModel):
+    args: List[Any] = Field(default_factory=list)
+    kwargs: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AskView(BaseModel):
+    start_hr: float
+    end_hr: float
+
+    @field_validator("end_hr")
+    @classmethod
+    def validate_window(cls, end_hr: float, info: Any) -> float:
+        start_hr = info.data.get("start_hr")
+        if start_hr is not None and end_hr < start_hr:
+            raise ValueError("ask_view.end_hr must be greater than or equal to ask_view.start_hr")
+        return end_hr
+
+
+class DsnActivityViewRequest(BaseModel):
+    activity_id: str
+    ask_view: AskView
+
+
+class DsnDataViewPeriodsRequest(BaseModel):
+    mission_id: str
+    activities: List[DsnActivityViewRequest] = Field(default_factory=list)
+
+
+def _ensure_core_exists() -> None:
+    if not CORE_FILE.exists():
+        raise FileNotFoundError(
+            f"Original delta implementation was not found: {CORE_FILE}. "
+            "Please ensure Scripts/delta_core.py exists."
+        )
+
+
+def _delegate_to_original_cli() -> None:
+    _ensure_core_exists()
+    sys.argv[0] = str(CORE_FILE)
+    runpy.run_path(str(CORE_FILE), run_name="__main__")
+
+
+def _load_core_module() -> Any:
+    _ensure_core_exists()
+    spec = importlib.util.spec_from_file_location("delta_core_api", CORE_FILE)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module spec from {CORE_FILE}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _round_hour(value: float) -> float:
+    return round(float(value), 10)
+
+
+def _clip_view_periods(view_periods: Any, ask_view: AskView) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    if not isinstance(view_periods, list):
+        return [], {"original": 0, "kept": 0, "deleted": 0, "clipped": 0}
+
+    clipped_periods: List[Dict[str, Any]] = []
+    clipped_count = 0
+
+    for period in view_periods:
+        if not isinstance(period, dict):
+            continue
+
+        try:
+            start_hr = float(period["start_hr"])
+            end_hr = float(period["end_hr"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if start_hr > ask_view.end_hr or end_hr < ask_view.start_hr:
+            continue
+
+        new_start = max(start_hr, ask_view.start_hr)
+        new_end = min(end_hr, ask_view.end_hr)
+
+        clipped_period = dict(period)
+        clipped_period["start_hr"] = _round_hour(new_start)
+        clipped_period["end_hr"] = _round_hour(new_end)
+
+        if new_start != start_hr or new_end != end_hr:
+            clipped_count += 1
+
+        clipped_periods.append(clipped_period)
+
+    original_count = len(view_periods)
+    kept_count = len(clipped_periods)
+    return clipped_periods, {
+        "original": original_count,
+        "kept": kept_count,
+        "deleted": original_count - kept_count,
+        "clipped": clipped_count,
+    }
+
+
+def _read_dsn_data_jsonl() -> List[Dict[str, Any]]:
+    if not DSN_DATA_FILE.exists():
+        raise HTTPException(status_code=404, detail=f"Data file not found: {DSN_DATA_FILE}")
+
+    records: List[Dict[str, Any]] = []
     try:
-        from matplotlib.font_manager import findfont, FontProperties
-        test_font = FontProperties(family=plt.rcParams['font.sans-serif'][0])
-        found = findfont(test_font, fallback_to_default=True)
-    except Exception:
-        pass  # 静默回退，字体链通常能处理
+        with DSN_DATA_FILE.open("r", encoding="utf-8") as file:
+            for line_no, line in enumerate(file, start=1):
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    record = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Invalid JSON in {DSN_DATA_FILE} at line {line_no}: {exc}",
+                    ) from exc
+                if isinstance(record, dict):
+                    records.append(record)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read {DSN_DATA_FILE}: {exc}") from exc
 
-# --- 算法实现核心类 ---
-class DeltaMILPScheduler:
-    def __init__(self, data_path, total_horizon_hr=168, granularity_min=15):
-        self.data_path = data_path
-        self.T = int(total_horizon_hr * 60 / granularity_min)  # 总时间帧数 (672) 
-        self.gran = granularity_min
-        self.missions_data = self._load_data()
-        
-    def _load_data(self):
-        missions = []
-        with open(self.data_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                missions.append(json.loads(line))
-        return missions
+    return records
 
-    def _get_priority_at_time(self, mission, time_hr):
-        """获取任务在指定时间的优先级(1-5)"""
-        pri_schedule = mission.get('priority_schedule', [])
-        for seg in pri_schedule:
-            if seg['start_hr'] <= time_hr < seg['end_hr']:
-                return seg['priority']
-        return mission.get('base_priority', 3)
 
-    def _get_activity_priority(self, mission, act):
-        """获取活动的加权优先级 - 基于其视图窗口的时间覆盖"""
-        pri_schedule = mission.get('priority_schedule', [])
-        base_pri = mission.get('base_priority', 3)
-        
-        if not pri_schedule:
-            return base_pri
-        
-        # 计算活动在各优先级时段的覆盖时长，取加权平均
-        total_weight = 0
-        total_duration = 0
-        for vp in act['view_periods']:
-            vp_start = vp['start_hr']
-            vp_end = vp['end_hr']
-            vp_dur = vp_end - vp_start
-            if vp_dur <= 0:
+def _write_dsn_data_jsonl(records: List[Dict[str, Any]]) -> None:
+    tmp_file = DSN_DATA_FILE.with_suffix(DSN_DATA_FILE.suffix + ".tmp")
+    try:
+        with tmp_file.open("w", encoding="utf-8", newline="\n") as file:
+            for record in records:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(tmp_file, DSN_DATA_FILE)
+    except OSError as exc:
+        try:
+            if tmp_file.exists():
+                tmp_file.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to write {DSN_DATA_FILE}: {exc}") from exc
+
+
+def update_dsn_data_view_periods(request: DsnDataViewPeriodsRequest) -> Dict[str, Any]:
+    activity_windows = {item.activity_id: item.ask_view for item in request.activities}
+    records = _read_dsn_data_jsonl()
+
+    mission_found = False
+    matched_activities = 0
+    missing_activities = sorted(activity_windows)
+    stats: Dict[str, Any] = {
+        "missions_matched": 0,
+        "activities_matched": 0,
+        "view_periods_original": 0,
+        "view_periods_kept": 0,
+        "view_periods_deleted": 0,
+        "view_periods_clipped": 0,
+        "activity_results": [],
+    }
+
+    for record in records:
+        if record.get("mission_id") != request.mission_id:
+            continue
+
+        mission_found = True
+        stats["missions_matched"] += 1
+        activities = record.get("activities", [])
+        if not isinstance(activities, list):
+            continue
+
+        for activity in activities:
+            if not isinstance(activity, dict):
                 continue
-            # 找该窗口覆盖的优先级时段
-            for seg in pri_schedule:
-                overlap_start = max(vp_start, seg['start_hr'])
-                overlap_end = min(vp_end, seg['end_hr'])
-                overlap = overlap_end - overlap_start
-                if overlap > 0:
-                    total_weight += seg['priority'] * overlap
-                    total_duration += overlap
-        
-        if total_duration > 0:
-            return total_weight / total_duration
-        return base_pri
+            activity_id = activity.get("activity_id")
+            ask_view = activity_windows.get(activity_id)
+            if ask_view is None:
+                continue
 
-    def _resolve_conflicts(self, candidates):
-        """
-        冲突解决：当天线时间槽冲突时，优先保留高优先级任务，舍弃低优先级任务。
-        天线选择策略：同一活动有多根天线可选时，优先选覆盖时长最长的天线（"看全程"），
-        同一任务内尽量复用已选天线以减少天线使用数量。
-        """
-        if not candidates:
-            return []
+            before_periods = activity.get("view_periods", [])
+            clipped_periods, clip_stats = _clip_view_periods(before_periods, ask_view)
+            activity["view_periods"] = clipped_periods
 
-        # 构建任务优先级映射
-        priority_map = {}
-        for m in self.missions_data:
-            m_id = m['mission_id']
-            base_pri = m.get('base_priority', 3)
-            pri_schedule = m.get('priority_schedule', [])
-            max_pri = max((s['priority'] for s in pri_schedule), default=base_pri)
-            priority_map[m_id] = max_pri
+            matched_activities += 1
+            if activity_id in missing_activities:
+                missing_activities.remove(activity_id)
 
-        # 1. 按活动分组候选
-        from collections import defaultdict
-        by_activity = defaultdict(list)
-        for c in candidates:
-            by_activity[c['Activity']].append(c)
+            stats["activities_matched"] += 1
+            stats["view_periods_original"] += clip_stats["original"]
+            stats["view_periods_kept"] += clip_stats["kept"]
+            stats["view_periods_deleted"] += clip_stats["deleted"]
+            stats["view_periods_clipped"] += clip_stats["clipped"]
+            stats["activity_results"].append(
+                {
+                    "activity_id": activity_id,
+                    "ask_view": {"start_hr": ask_view.start_hr, "end_hr": ask_view.end_hr},
+                    **clip_stats,
+                }
+            )
 
-        # 2. 对各活动内的天线候选排序：覆盖率高的优先，其次优先复用同任务天线
-        mission_antennas = defaultdict(set)  # mission -> 已使用的天线集合
+    if not mission_found:
+        raise HTTPException(status_code=404, detail=f"mission_id not found: {request.mission_id}")
+    if activity_windows and matched_activities == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No requested activity_id found for mission_id: {request.mission_id}",
+        )
 
-        for act_key in by_activity:
-            mission = by_activity[act_key][0]['Mission']
-            by_activity[act_key].sort(key=lambda c: (
-                -c['Coverage'],                              # 主排序：覆盖时长长 → 优先
-                0 if c['Antenna'] in mission_antennas[mission] else 1  # 次排序：复用天线 → 优先
-            ))
+    _write_dsn_data_jsonl(records)
+    return {
+        "success": True,
+        "file": str(DSN_DATA_FILE),
+        "mission_id": request.mission_id,
+        "requested_activities": sorted(activity_windows),
+        "missing_activities": missing_activities,
+        **stats,
+    }
 
-        # 3. 按优先级降序排列活动（高优先级活动先分配资源），同优先级按开始时间升序
-        def activity_sort_key(act_key):
-            first = by_activity[act_key][0]
-            return (-priority_map.get(first['Mission'], 3), first['Start'])
 
-        sorted_activities = sorted(by_activity.keys(), key=activity_sort_key)
+def create_app() -> FastAPI:
+    app = FastAPI(title="Delta API", version="1.0.0")
 
-        final_schedule = []
-        antenna_timeline = {}   # antenna -> list of (start, end) 已占用区间
-        mission_timeline = {}   # mission -> list of (start, end) 已占用区间
+    @app.get("/health")
+    def health() -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "project_root": str(PROJECT_ROOT),
+            "core_file": str(CORE_FILE),
+            "dsn_data_file": str(DSN_DATA_FILE),
+            "core_exists": CORE_FILE.exists(),
+            "dsn_data_exists": DSN_DATA_FILE.exists(),
+        }
 
-        dropped_count = 0
-        dropped_by_priority = []  # 记录被舍弃的任务及优先级
+    @app.post("/api/delta/run")
+    def run_delta(request: RunRequest) -> Dict[str, Any]:
+        _ensure_core_exists()
 
-        for act_key in sorted_activities:
-            mission = by_activity[act_key][0]['Mission']
-            scheduled = False
+        cwd = Path(request.cwd).resolve() if request.cwd else PROJECT_ROOT
+        if not cwd.exists() or not cwd.is_dir():
+            raise HTTPException(status_code=400, detail=f"Invalid cwd: {cwd}")
 
-            # 按排序好的天线候选依次尝试（最佳天线优先）
-            for item in by_activity[act_key]:
-                antenna = item['Antenna']
-                # 包含 setup 和 teardown 的完整占用区间
-                item_start = item['Start'] - item['Setup']
-                item_end = item['End'] + item['Teardown']
+        if isinstance(request.stdin, str) or request.stdin is None:
+            stdin_text = request.stdin
+        else:
+            stdin_text = json.dumps(request.stdin, ensure_ascii=False)
 
-                # --- 检查天线级冲突 (Constraint 6h) ---
-                antenna_conflict = False
-                for (start, end) in antenna_timeline.get(antenna, []):
-                    if item_start < end and start < item_end:
-                        antenna_conflict = True
-                        break
+        command = [sys.executable, str(CORE_FILE), *[str(arg) for arg in request.args]]
 
-                # --- 检查任务级冲突 (Constraint 6j: 同一航天器不能同时占用两个天线) ---
-                mission_conflict = False
-                for (start, end) in mission_timeline.get(mission, []):
-                    if item_start < end and start < item_end:
-                        mission_conflict = True
-                        break
+        try:
+            completed = subprocess.run(
+                command,
+                input=stdin_text,
+                text=True,
+                capture_output=True,
+                timeout=request.timeout,
+                cwd=str(cwd),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "message": f"delta execution timed out after {request.timeout} seconds",
+                    "stdout": exc.stdout,
+                    "stderr": exc.stderr,
+                },
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Failed to execute delta_core.py",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            ) from exc
 
-                if not antenna_conflict and not mission_conflict:
-                    # 无冲突，保留该活动
-                    antenna_timeline.setdefault(antenna, []).append((item_start, item_end))
-                    mission_timeline.setdefault(mission, []).append((item_start, item_end))
-                    mission_antennas[mission].add(antenna)
-                    final_schedule.append(item)
-                    scheduled = True
-                    break
-                # 有冲突 → 继续尝试该活动的下一个天线候选
+        stdout_json: Optional[Any] = None
+        if request.parse_json and completed.stdout:
+            try:
+                stdout_json = json.loads(completed.stdout)
+            except json.JSONDecodeError:
+                stdout_json = None
 
-            if not scheduled:
-                # 所有天线候选均冲突，舍弃该活动
-                dropped_count += 1
-                dropped_by_priority.append((mission, priority_map.get(mission, 3)))
+        return {
+            "success": completed.returncode == 0,
+            "return_code": completed.returncode,
+            "command": command,
+            "cwd": str(cwd),
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "stdout_json": stdout_json,
+        }
 
-        if dropped_count > 0:
-            avg_dropped_pri = sum(p for _, p in dropped_by_priority) / len(dropped_by_priority)
-            kept_pri = [priority_map.get(item['Mission'], 3) for item in final_schedule]
-            avg_kept_pri = sum(kept_pri) / len(kept_pri) if kept_pri else 0
-            print(f"  [冲突解决] 舍弃 {dropped_count} 个低优先级活动，"
-                  f"保留 {len(final_schedule)} 个活动")
-            print(f"  被舍弃活动平均优先级: {avg_dropped_pri:.2f}, "
-                  f"保留活动平均优先级: {avg_kept_pri:.2f}")
+    @app.get("/api/delta/functions")
+    def list_functions() -> Dict[str, Any]:
+        try:
+            module = _load_core_module()
+            functions = sorted(
+                name
+                for name, value in vars(module).items()
+                if callable(value) and not name.startswith("_")
+            )
+            return {"functions": functions}
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Failed to inspect delta_core.py. Use /api/delta/run if the script is not import-safe.",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            ) from exc
 
-        # 统计天线复用情况
-        total_antennas = set()
-        for item in final_schedule:
-            total_antennas.add(item['Antenna'])
-        per_mission_antennas = {m_id: len(ants) for m_id, ants in mission_antennas.items()}
-        avg_antennas = sum(per_mission_antennas.values()) / len(per_mission_antennas) if per_mission_antennas else 0
-        print(f"  [天线统计] 共使用 {len(total_antennas)} 根天线，每任务平均天线数: {avg_antennas:.1f}")
+    @app.post("/api/delta/call/{function_name}")
+    def call_function(function_name: str, request: FunctionCallRequest) -> Dict[str, Any]:
+        try:
+            module = _load_core_module()
+            target = getattr(module, function_name, None)
+            if target is None or not callable(target) or function_name.startswith("_"):
+                raise HTTPException(status_code=404, detail=f"Callable not found: {function_name}")
 
-        return final_schedule
+            result = target(*request.args, **request.kwargs)
+            return {"success": True, "result": jsonable_encoder(result)}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": f"Failed to call function: {function_name}",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            ) from exc
 
-    def solve(self, mission_weights, eta_threshold):
-        """
-        核心 MILP 求解逻辑 (Equation 6a-6m)
-        集成优先级系统：高优先级任务在冲突时优先获得资源
-        """
-        prob = pulp.LpProblem("Delta_MILP", pulp.LpMaximize)
-        
-        # 1. 定义变量
-        x = {} 
-        
-        # 预处理任务拆分 (Algorithm 1)
-        active_activities = []
-        for m in self.missions_data:
-            m_id = m['mission_id']
-            for act in m['activities']:
-                a_id = act['activity_id']
-                
-                # 基础变量
-                x[a_id] = pulp.LpVariable(f"x_{a_id}", cat='Binary')
-                # 计算该活动的优先级权重
-                act_priority = self._get_activity_priority(m, act)
-                active_activities.append((m_id, act, a_id, False, act_priority))
-                
-                # XOR 拆分逻辑：如果满足拆分条件 (Algorithm 1)
-                if act['can_split']:
-                    a_prime = f"{a_id}_prime"
-                    a_dprime = f"{a_id}_dprime"
-                    x[a_prime] = pulp.LpVariable(f"x_{a_prime}", cat='Binary')
-                    x[a_dprime] = pulp.LpVariable(f"x_{a_dprime}", cat='Binary')
-                    
-                    # 约束 6k, 6l: 子任务必须成对调度
-                    prob += x[a_prime] == x[a_dprime]
-                    # 约束 6m: 原始与拆分互斥
-                    prob += x[a_id] + x[a_prime] <= 1
-                    
-                    # 添加子活动到处理列表
-                    active_activities.append((m_id, act, a_prime, True, act_priority))
-                    active_activities.append((m_id, act, a_dprime, True, act_priority))
+    @app.post("/api/delta/dsn-data/view-periods")
+    def clip_dsn_data_view_periods(request: DsnDataViewPeriodsRequest) -> Dict[str, Any]:
+        return update_dsn_data_view_periods(request)
 
-        # 2. 目标函数 (Equation 6a)
-        # 权重 = 迭代权重 × 优先级权重
-        # 优先级高的活动在目标函数中系数更大，冲突时求解器会优先保留
-        obj_elements = []
-        for m_id, act, a_name, is_split, act_priority in active_activities:
-            iter_weight = mission_weights.get(m_id, 1.0)
-            # 优先级权重: priority^2 使高优先级优势更明显
-            priority_weight = act_priority ** 2  # 1,4,9,16,25
-            # 如果是拆分任务，权重减半
-            coeff = iter_weight * priority_weight * (0.5 if is_split else 1.0)
-            obj_elements.append(coeff * x[a_name])
-        prob += pulp.lpSum(obj_elements)
+    return app
 
-        # 3. 物理约束
-        # 约束 6i: 持续时间限制
-        total_resource_usage = []
-        for m_id, act, a_name, is_split, act_priority in active_activities:
-            dur = act['d_max'] / 2 if is_split else act['d_max']
-            total_resource_usage.append(dur * x[a_name])
-        
-        # 总天线资源容量约束
-        prob += pulp.lpSum(total_resource_usage) <= 40 * 168 * 0.7  # 40台天线, 70%利用率
 
-        # 4. 执行求解 - 使用GLPK并设置时间限制
-        solver = pulp.GLPK_CMD(msg=1, options=['--tmlim', '60'], path=_GLPK_PATH)  # 每次求解最多60秒
-        prob.solve(solver) 
-        
-        # 5. 生成候选调度结果（为每个已调度活动生成所有可选视图窗口的候选）
-        raw_candidates = []
-        for m in self.missions_data:
-            m_id = m['mission_id']
-            for act in m['activities']:
-                a_id = act['activity_id']
-                # 检查是否被选中
-                if pulp.value(x[a_id]) is not None and pulp.value(x[a_id]) > 0.5:
-                    # 为该活动的每个视图窗口生成候选
-                    for vp in act['view_periods']:
-                        # 计算该天线窗口能实际覆盖的时长
-                        desired_end = vp['start_hr'] + act['d_max']
-                        trackable_end = min(vp['end_hr'], desired_end)
-                        coverage = max(trackable_end - vp['start_hr'], 0)
-                        raw_candidates.append({
-                            "Mission": m_id,
-                            "Activity": a_id,
-                            "Antenna": vp['antenna'],
-                            "Start": vp['start_hr'],
-                            "End": desired_end,
-                            "ViewEnd": vp['end_hr'],
-                            "Coverage": coverage,  # 该天线实际可追踪时长
-                            "Setup": act['setup_min'] / 60,
-                            "Teardown": act['teardown_min'] / 60
-                        })
+def start_api(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None:
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise RuntimeError(
+            "API mode requires uvicorn. Please install dependencies with: "
+            "pip install fastapi uvicorn pydantic"
+        ) from exc
 
-        # 6. 冲突解决：优先保留高优先级，舍弃低优先级
-        schedule_results = self._resolve_conflicts(raw_candidates)
+    if str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
 
-        # 7. 计算满意度结果
-        satisfaction = {}
-        for m in self.missions_data:
-            m_id = m['mission_id']
-            scheduled_hr = sum(r['End'] - r['Start'] for r in schedule_results if r['Mission'] == m_id)
-            satisfaction[m_id] = scheduled_hr / m['total_requested_hr'] if m['total_requested_hr'] > 0 else 0
-            
-        return satisfaction, schedule_results
+    if reload:
+        uvicorn.run(
+            "delta:create_app",
+            host=host,
+            port=port,
+            reload=True,
+            reload_dirs=[str(SCRIPTS_DIR)],
+            factory=True,
+        )
+    else:
+        app = create_app()
+        uvicorn.run(app, host=host, port=port)
 
-def visualize_and_save(schedule_list, filename="dsn_schedule.csv"):
-    if not schedule_list:
-        print("没有可生成的调度数据。")
+
+def _parse_wrapper_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Delta wrapper. Use --api to start HTTP service; omit --api to run original delta CLI.",
+        add_help=True,
+    )
+    parser.add_argument("--api", action="store_true", help="Start FastAPI service instead of original CLI.")
+    parser.add_argument("--host", default="0.0.0.0", help="API host, default: 0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000, help="API port, default: 8000")
+    parser.add_argument("--reload", action="store_true", help="Enable uvicorn reload in API mode.")
+    args, remaining = parser.parse_known_args(argv)
+    args.remaining_args = remaining
+    return args
+
+
+def main() -> None:
+    args = _parse_wrapper_args(sys.argv[1:])
+    if args.api:
+        start_api(host=args.host, port=args.port, reload=args.reload)
         return
 
-    # 1. 保存为 CSV
-    df = pd.DataFrame(schedule_list)
-    df.to_csv(filename, index=False)
-    print(f"详细调度表已保存至: {filename}")
-
-    # 2. 绘制甘特图 — 纵轴为任务(Mission)，颜色表示天线(Antenna)
-    plt.figure(figsize=(18, 10))
-    missions = sorted(df['Mission'].unique())
-    antennas = sorted(df['Antenna'].unique())
-    colors = plt.cm.tab20(np.linspace(0, 1, len(antennas)))
-    color_map = dict(zip(antennas, colors))
-
-    for i, row in df.iterrows():
-        mission_idx = missions.index(row['Mission'])
-
-        # 绘制准备时间 (Setup) - 灰色
-        plt.barh(mission_idx, row['Setup'], left=row['Start'] - row['Setup'],
-                 color='lightgrey', edgecolor='gray', alpha=0.5)
-
-        # 绘制跟踪时间 (Tracking) - 天线颜色
-        plt.barh(mission_idx, row['End'] - row['Start'], left=row['Start'],
-                 color=color_map[row['Antenna']], edgecolor='black', label=row['Antenna'])
-
-        # 绘制拆除时间 (Teardown) - 灰色
-        plt.barh(mission_idx, row['Teardown'], left=row['End'],
-                 color='lightgrey', edgecolor='gray', alpha=0.5)
-
-        # 标注天线名
-        plt.text(row['Start'], mission_idx, row['Antenna'], va='center', ha='left', fontsize=6)
-
-    plt.yticks(range(len(missions)), missions, fontsize=7)
-    plt.xlabel("时间 (小时, 从周一 00:00 开始)")
-    plt.title("地面探测站航天器检测任务调度甘特图 (Delta-MILP 优先级调度)")
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
-
-    # 防止图例重复
-    handles, labels = plt.gca().get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    plt.legend(by_label.values(), by_label.keys(), loc='upper right',
-               bbox_to_anchor=(1.15, 1), fontsize=7, title="天线")
-    
-    plt.tight_layout()
-    img_path = "dsn_gantt_chart.png"
-    plt.savefig(img_path, dpi=150)
-    plt.close()
-    print(f"甘特图已保存至: {img_path}")
-
-    # 使用系统默认图片查看器打开
-    try:
-        if platform.system() == "Windows":
-            os.startfile(img_path)
-        elif platform.system() == "Darwin":
-            subprocess.Popen(["open", img_path])
-        else:
-            subprocess.Popen(["xdg-open", img_path])
-    except Exception as e:
-        print(f"无法自动打开图片查看器: {e}")
-
-# --- 3. 动态权重迭代逻辑 (Algorithm 2) ---
-import sys
-import numpy as np
-
-# --- 新增：日志记录类 ---
-class Logger(object):
-    def __init__(self, filename=None):
-        if filename is None:
-            import os
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            filename = os.path.join(script_dir, "..", "Outputs", "optimization_log.txt")
-        self.terminal = sys.stdout
-        self.log = open(filename, "w", encoding="utf-8")
-
-    def write(self, message):
-        try:
-            self.terminal.write(message)
-        except UnicodeEncodeError:
-            # Windows GBK console can't handle ✓/✗ — replace with ASCII
-            import re
-            safe = message.replace('✓', '[OK]').replace('✗', '[XX]')
-            self.terminal.write(safe)
-        self.log.write(message)
-
-    def flush(self):
-        pass
-
-def run_dynamic_optimization(data_path):
-    # 将标准输出重定向至文件
-    sys.stdout = Logger()
-    
-    scheduler = DeltaMILPScheduler(data_path)
-    mission_ids = [m['mission_id'] for m in scheduler.missions_data]
-    weights = {m_id: 1.0 for m_id in mission_ids}
-    eta = 0.15  
-    eta_plus = 0.05 
-    k_max = 10 
-
-    print("="*60)
-    print(f"地面探测站航天器检测任务调度优化 - Delta-MILP 算法")
-    print(f"任务总数: {len(mission_ids)} | 初始阈值: {eta*100}% | 最大迭代次数: {k_max}")
-    print("="*60)
-
-    # 打印优先级分布
-    pri_dist = {}
-    for m in scheduler.missions_data:
-        bp = m.get('base_priority', 3)
-        pri_dist[bp] = pri_dist.get(bp, 0) + 1
-    print(f"\n任务优先级分布:")
-    for pri in sorted(pri_dist.keys()):
-        desc = PRIORITY_LEVELS.get(pri, "")
-        print(f"  优先级 {pri} ({desc}): {pri_dist[pri]} 个任务")
-    print()
-    
-    final_schedule = None
-    for k in range(k_max):
-        sats, schedule = scheduler.solve(weights, eta)
-        if k == k_max - 1:
-            final_schedule = schedule
-        min_sat = min(sats.values())
-        avg_sat = np.mean(list(sats.values()))
-        
-        print(f"\n[迭代 {k}]")
-        print(f"- 最小满意度 (U_MIN): {min_sat:.2%}")
-        print(f"- 平均满意度 (U_AVG): {avg_sat:.2%}")
-        print(f"- 调度活动数: {len(schedule)}")
-        
-        under_satisfied = []
-        for m_id, sat_val in sats.items():
-            if sat_val < eta:
-                weights[m_id] *= 2.0  
-                under_satisfied.append(m_id)
-        
-        if not under_satisfied:
-            print(f"> 状态: 所有任务达到阈值 {eta*100:.1f}%, 提升阈值。")
-            eta += eta_plus
-        else:
-            print(f"> 状态: 发现 {len(under_satisfied)} 个欠调度任务，已提升权重。")
-            print(f"> 欠调度任务列表: {', '.join(under_satisfied[:5])}...")
-
-    # 获取最终调度结果
-    final_sats, final_schedule = scheduler.solve(weights, eta)
-
-    # 构建任务优先级映射
-    mission_priorities = {}
-    for m in scheduler.missions_data:
-        m_id = m['mission_id']
-        base_pri = m.get('base_priority', 3)
-        pri_schedule = m.get('priority_schedule', [])
-        max_pri = max((s['priority'] for s in pri_schedule), default=base_pri)
-        mission_priorities[m_id] = (base_pri, max_pri)
-
-    print("\n" + "="*60)
-    print("优化完成。最终满意度指标：")
-    print("="*60)
-    print(f"{'任务ID':<12} {'基础优先级':>10} {'峰值优先级':>10} {'满意度':>10} {'状态':>8}")
-    print("-"*60)
-    for m_id, sat_val in sorted(final_sats.items()):
-        base_pri, max_pri = mission_priorities.get(m_id, (3, 3))
-        status = "✓ 达标" if sat_val >= eta else "✗ 欠调度"
-        print(f"{m_id:<12} {base_pri:>10} {max_pri:>10} {sat_val:>9.1%} {status:>8}")
-    print("-"*60)
-    print(f"最小满意度: {min(final_sats.values()):.1%}")
-    print(f"平均满意度: {np.mean(list(final_sats.values())):.1%}")
-    print(f"调度活动数: {len(final_schedule)}")
-    
-    # 优先级-满意度相关性分析
-    print(f"\n--- 优先级冲突分析 ---")
-    # 按基础优先级分组统计平均满意度
-    pri_groups = {}
-    for m_id, sat_val in final_sats.items():
-        base_pri = mission_priorities.get(m_id, (3,3))[0]
-        if base_pri not in pri_groups:
-            pri_groups[base_pri] = []
-        pri_groups[base_pri].append(sat_val)
-    
-    print(f"{'优先级':>8} {'任务数':>6} {'平均满意度':>10} {'说明':>20}")
-    for pri in sorted(pri_groups.keys()):
-        sats_list = pri_groups[pri]
-        desc = PRIORITY_LEVELS.get(pri, "")
-        print(f"{pri:>8} {len(sats_list):>6} {np.mean(sats_list):>10.1%} {desc:>20}")
-    
-    # 被舍弃的任务分析
-    dropped = [m_id for m_id, sat in final_sats.items() if sat < eta]
-    if dropped:
-        dropped_pri = [mission_priorities.get(m_id, (3,3))[0] for m_id in dropped]
-        kept_pri = [mission_priorities.get(m_id, (3,3))[0] for m_id in final_sats if m_id not in dropped]
-        print(f"\n被舍弃任务({len(dropped)}个)的平均优先级: {np.mean(dropped_pri):.1f}")
-        print(f"保留任务({len(final_sats)-len(dropped)}个)的平均优先级: {np.mean(kept_pri):.1f}")
-        print(f"结论: {'高优先级任务得到优先保留 ✓' if np.mean(kept_pri) > np.mean(dropped_pri) else '需调整优先级权重'}")
-    else:
-        # 分析低满意度vs高满意度任务的优先级差异
-        low_sat = [m_id for m_id, sat in final_sats.items() if sat < 0.3]
-        high_sat = [m_id for m_id, sat in final_sats.items() if sat >= 0.8]
-        if low_sat and high_sat:
-            low_pri = [mission_priorities.get(m_id, (3,3))[0] for m_id in low_sat]
-            high_pri = [mission_priorities.get(m_id, (3,3))[0] for m_id in high_sat]
-            print(f"\n低满意度(<30%)任务({len(low_sat)}个)平均优先级: {np.mean(low_pri):.1f}")
-            print(f"高满意度(≥80%)任务({len(high_sat)}个)平均优先级: {np.mean(high_pri):.1f}")
-            if np.mean(high_pri) > np.mean(low_pri):
-                print(f"结论: 高优先级任务在冲突中优先获得资源 ✓")
-            else:
-                print(f"结论: 优先级权重需进一步调整")
-
-    # 调度活动数统计
-    scheduled_missions = set(r['Mission'] for r in final_schedule)
-    print(f"\n--- 调度统计 ---")
-    print(f"成功调度任务数: {len(scheduled_missions)}/{len(final_sats)}")
-    print(f"成功调度活动数: {len(final_schedule)}")
-    print(f"使用天线数: {len(set(r['Antenna'] for r in final_schedule))}")
-    print("="*60)
-
-    # 可视化并保存
-    visualize_and_save(final_schedule)
+    # Preserve the original command-line behavior when --api is not supplied.
+    sys.argv = [str(CORE_FILE), *args.remaining_args]
+    _delegate_to_original_cli()
 
 
-set_ch_font()
-# 运行模拟 - 使用绝对路径
-import os
-script_dir = os.path.dirname(os.path.abspath(__file__))
-data_path = os.path.join(script_dir, "..", "Data", "dsn_data.jsonl")
-run_dynamic_optimization(data_path)
+if __name__ == "__main__":
+    main()

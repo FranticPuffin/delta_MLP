@@ -8,13 +8,33 @@ __pycache__/
 venv/
 env/
 
-# Offline packages (large binary files, not version-controlled)
+# Offline packages / GLPK / python distribution (large binaries)
 packages/
-
-# Bundled GLPK solver (binary, not version-controlled)
 glpk/
+python/
+_build_offline/
 
 # Output files (generated at runtime)
-Outputs/optimization_log.txt
+Outputs/
 dsn_schedule.csv
 dsn_gantt_chart.png
+
+# Test / temp / data generator scratch files
+test_*.py
+make_chinese_sample.py
+Data/*.jsonl
+Data/j.json
+
+# Backup files
+*.bak
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Only track top-level files, Scripts/, Docs/ and top-level documentation.
+# Explicitly ignore any other sub-directories that might appear.
+# (Keep whitelist empty - git tracks files explicitly added; this ignore just
+#  makes untracked junk not show up.)
