@@ -295,14 +295,20 @@ def create_app() -> FastAPI:
 
         command = [sys.executable, str(CORE_FILE), *[str(arg) for arg in request.args]]
 
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
         try:
             completed = subprocess.run(
                 command,
                 input=stdin_text,
                 text=True,
                 capture_output=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=request.timeout,
                 cwd=str(cwd),
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
             raise HTTPException(
